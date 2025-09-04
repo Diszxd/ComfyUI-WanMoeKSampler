@@ -2,7 +2,30 @@ import torch
 import comfy.sample
 import comfy.samplers
 import comfy.utils
+import comfy.model_sampling
 import latent_preview
+
+def get_or_create_model_sampling(model):
+    model_sampling = model.get_model_object("model_sampling")
+    if model_sampling is not None:
+        return model_sampling
+
+    # Create a new model_sampling object if not found
+    sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
+    sampling_type = comfy.model_sampling.CONST
+
+    class ModelSamplingAdvanced(sampling_base, sampling_type):
+        pass
+
+    model_config = model.model.model_config
+    model_sampling = ModelSamplingAdvanced(model_config)
+    return model_sampling
+
+def set_shift(model, sigma_shift):
+    model_sampling = get_or_create_model_sampling(model)
+    model_sampling.set_parameters(shift=sigma_shift, multiplier=1000)
+    model.add_object_patch("model_sampling", model_sampling)
+    return model
 
 def wan_ksampler(model_high_noise, model_low_noise, seed, steps, cfgs, sampler_name, scheduler, positive, negative, latent, boundary=0.875, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
     latent_image = latent["samples"]
@@ -23,13 +46,13 @@ def wan_ksampler(model_high_noise, model_low_noise, seed, steps, cfgs, sampler_n
     if start_step is None:
         start_step = 0
     if last_step is None:
-        last_step = 9999
+        last_step=9999
 
-    # Используем стандартный способ получения параметров сэмплинга
-    sampling = model_high_noise.get_model_object("model_sampling")
+    # Get model_sampling safely
+    sampling = get_or_create_model_sampling(model_high_noise)
     sigmas = comfy.samplers.calculate_sigmas(sampling, scheduler, steps)
     
-    # Конвертируем сигмы в таймстепы (0-1)
+    # Convert sigmas to timesteps (0-1 range)
     timesteps = [sampling.timestep(sigma)/1000 for sigma in sigmas.tolist()]
     
     switching_step = steps
@@ -86,6 +109,8 @@ class WanMoeKSampler:
                 "cfg_low_noise": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "The Classifier-Free Guidance scale for low noise model."}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "The algorithm used when sampling, this can affect the quality, speed, and style of the generated output."}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "The scheduler controls how noise is gradually removed to form the image."}),
+                "sigma_shift_high": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Shift parameter for high noise model (similar to ModelSamplingSD3)"}),
+                "sigma_shift_low": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Shift parameter for low noise model (similar to ModelSamplingSD3)"}),
                 "positive": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to include in the image."}),
                 "negative": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to exclude from the image."}),
                 "latent_image": ("LATENT", {"tooltip": "The latent image to denoise."}),
@@ -100,7 +125,10 @@ class WanMoeKSampler:
     CATEGORY = "sampling"
     DESCRIPTION = "Uses the provided model, positive and negative conditioning to denoise the latent image."
 
-    def sample(self, model_high_noise, model_low_noise, boundary, seed, steps, cfg_high_noise, cfg_low_noise, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0):
+    def sample(self, model_high_noise, model_low_noise, boundary, seed, steps, cfg_high_noise, cfg_low_noise, sampler_name, scheduler, sigma_shift_high, sigma_shift_low, positive, negative, latent_image, denoise=1.0):
+        model_high_noise = set_shift(model_high_noise, sigma_shift_high)
+        model_low_noise = set_shift(model_low_noise, sigma_shift_low)
+
         return wan_ksampler(
             model_high_noise, 
             model_low_noise, 
@@ -130,6 +158,8 @@ class WanMoeKSamplerAdvanced:
                 "cfg_low_noise": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, ),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, ),
+                "sigma_shift_high": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Shift parameter for high noise model"}),
+                "sigma_shift_low": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Shift parameter for low noise model"}),
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
                 "latent_image": ("LATENT", ),
@@ -144,7 +174,10 @@ class WanMoeKSamplerAdvanced:
 
     CATEGORY = "sampling"
 
-    def sample(self, model_high_noise, model_low_noise, boundary, add_noise, noise_seed, steps, cfg_high_noise, cfg_low_noise, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, denoise=1.0):
+    def sample(self, model_high_noise, model_low_noise, boundary, add_noise, noise_seed, steps, cfg_high_noise, cfg_low_noise, sampler_name, scheduler, sigma_shift_high, sigma_shift_low, positive, negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, denoise=1.0):
+        model_high_noise = set_shift(model_high_noise, sigma_shift_high)
+        model_low_noise = set_shift(model_low_noise, sigma_shift_low)
+        
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -194,7 +227,7 @@ class SplitSigmasAtT:
 
     def split(self, boundary, sigmas:torch.Tensor, model = None):
         if model is None:
-            # Создаем объект сэмплинга по умолчанию
+            # Create default sampling object
             sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow  
             sampling_type = comfy.model_sampling.CONST
 
@@ -203,16 +236,7 @@ class SplitSigmasAtT:
                 
             sampling = ModelSamplingAdvanced()
         else:
-            sampling = model.get_model_object("model_sampling")
-            if sampling is None:
-                # Фолбэк на случай отсутствия model_sampling
-                sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow  
-                sampling_type = comfy.model_sampling.CONST
-
-                class ModelSamplingAdvanced(sampling_base, sampling_type):
-                    pass
-                    
-                sampling = ModelSamplingAdvanced()
+            sampling = get_or_create_model_sampling(model)
 
         timesteps = [sampling.timestep(sigma)/1000 for sigma in sigmas.tolist()]
         switching_step = sigmas.size(0)
